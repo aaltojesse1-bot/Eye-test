@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse Lab</title>
+<style>
+:root{
+  --bg:#E9EEEC; --surface:#F8FAF9; --ink:#16262B; --muted:#5B6E73;
+  --trace:#0E7C86; --warn:#A8661A; --line:#C9D3D1; --good:#2F7D4A;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0E1A1D; --surface:#152427; --ink:#E3ECEA; --muted:#8FA3A6;
+    --trace:#3FC1C9; --warn:#E2B04A; --line:#24383C; --good:#6CC28A;
+    color-scheme: dark;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Avenir Next","Segoe UI",system-ui,sans-serif;line-height:1.45}
+main{max-width:520px;margin:0 auto;padding:16px 16px 40px}
+h1{font-size:1.15rem;font-weight:600;margin:4px 0 12px;letter-spacing:.01em}
+.cam{position:relative;width:100%;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:4/3}
+video{width:100%;height:100%;object-fit:contain;transform:scaleX(-1);display:block}
+.oval{position:absolute;left:30%;top:10%;width:40%;height:75%;border:2px dashed rgba(255,255,255,.55);border-radius:50%}
+.roi{position:absolute;left:40%;top:18%;width:20%;height:10%;border:2px solid var(--trace);border-radius:4px}
+.hint{position:absolute;left:0;right:0;bottom:8px;text-align:center;color:#fff;font-size:.85rem;text-shadow:0 1px 3px #000}
+.readout{display:flex;align-items:baseline;gap:10px;margin:16px 0 4px}
+.bpm{font-size:3.4rem;font-weight:300;font-variant-numeric:tabular-nums;line-height:1}
+.unit{color:var(--muted)}
+.status{font-size:.9rem;color:var(--muted);min-height:1.4em}
+.status b{font-weight:600}
+canvas#wave{width:100%;height:90px;display:block;margin:8px 0 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+button,select{font:inherit;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink)}
+button.primary{background:var(--trace);border-color:var(--trace);color:var(--surface)}
+button:focus-visible,select:focus-visible{outline:3px solid var(--trace);outline-offset:2px}
+button:disabled{opacity:.45}
+section{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-top:14px}
+section p{margin:0 0 8px;font-size:.9rem;color:var(--muted)}
+textarea{width:100%;height:120px;font:12px/1.4 ui-monospace,Menlo,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px}
+.err{color:var(--warn)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Pulse Lab</h1>
+  <div class="cam">
+    <video id="video" playsinline muted></video>
+    <div class="oval"></div><div class="roi"></div>
+    <div class="hint" id="hint">Face inside the oval, forehead in the box, even light</div>
+  </div>
+
+  <div class="readout"><span class="bpm" id="bpm">--</span><span class="unit">bpm</span></div>
+  <div class="status" id="status">Press Start to open the front camera.</div>
+  <canvas id="wave"></canvas>
+
+  <div class="row">
+    <button class="primary" id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="export" disabled>Export CSV</button>
+  </div>
+
+  <section>
+    <p>How sleepy are you right now? 1 = extremely alert, 9 = fighting sleep. Rate every few minutes so the pulse data has labels.</p>
+    <div class="row">
+      <select id="kss" aria-label="Sleepiness rating">
+        <option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option>
+        <option>6</option><option>7</option><option>8</option><option>9</option>
+      </select>
+      <button id="rate" disabled>Log rating</button>
+    </div>
+    <div class="status" id="rated"></div>
+  </section>
+
+  <section>
+    <p>Session data (one row per second). If the download is blocked, copy it from here.</p>
+    <textarea id="csv" readonly></textarea>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), grab = document.createElement('canvas'), gctx = grab.getContext('2d', {willReadFrequently:true});
+const wave = $('wave'), wctx = wave.getContext('2d');
+let stream = null, running = false, samples = [], log = [], bpmHist = [], t0 = 0, tick = null, lastWave = [];
+
+$('start').onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:{ideal:640}, height:{ideal:480}}, audio:false});
+  } catch (e) {
+    $('status').innerHTML = '<span class="err">Camera blocked: ' + e.name + '. Open this file in your phone browser over https and allow camera access.</span>';
+    return;
+  }
+  video.srcObject = stream; await video.play();
+  grab.width = video.videoWidth; grab.height = video.videoHeight;
+  running = true; samples = []; log = []; bpmHist = []; t0 = performance.now();
+  $('start').disabled = true; $('stop').disabled = false; $('rate').disabled = false; $('export').disabled = true;
+  $('status').textContent = 'Collecting signal. Hold still for about 10 seconds.';
+  requestAnimationFrame(sample);
+  tick = setInterval(estimate, 1000);
+};
+
+$('stop').onclick = () => {
+  running = false; clearInterval(tick);
+  stream && stream.getTracks().forEach(t => t.stop());
+  $('start').disabled = false; $('stop').disabled = true; $('export').disabled = log.length === 0;
+  $('status').textContent = 'Stopped. ' + log.length + ' rows recorded.';
+  $('csv').value = toCSV();
+};
+
+$('rate').onclick = () => {
+  const v = $('kss').value, t = ((performance.now() - t0) / 1000).toFixed(1);
+  log.push({t, bpm:'', q:'', trend:'', light:'', event:'sleepiness=' + v});
+  $('rated').textContent = 'Logged sleepiness ' + v + ' at ' + t + ' s';
+};
+
+$('export').onclick = () => {
+  const csv = toCSV(); $('csv').value = csv;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+  a.download = 'pulse-session-' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.csv';
+  a.click();
+};
+
+function toCSV(){
+  return 'time_s,bpm,quality,trend,brightness,event\n' +
+    log.map(r => [r.t, r.bpm, r.q, r.trend, r.light, r.event].join(',')).join('\n');
+}
+
+function sample(){
+  if (!running) return;
+  const W = grab.width, H = grab.height;
+  gctx.drawImage(video, 0, 0, W, H);
+  const x = Math.round(W*.40), y = Math.round(H*.18), w = Math.round(W*.20), h = Math.round(H*.10);
+  const d = gctx.getImageData(x, y, w, h).data;
+  let r=0,g=0,b=0,n=d.length/4;
+  for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; }
+  const t = performance.now();
+  samples.push({t, r:r/n, g:g/n, b:b/n});
+  while (samples.length && samples[0].t < t - 20000) samples.shift();
+  requestAnimationFrame(sample);
+}
+
+const mean = a => a.reduce((s,v)=>s+v,0)/a.length;
+const std = a => { const m = mean(a); return Math.sqrt(mean(a.map(v=>(v-m)**2))); };
+const median = a => { const s=[...a].sort((x,y)=>x-y); return s.length ? s[Math.floor(s.length/2)] : NaN; };
+
+function resample(win, key, fs){
+  const start = win[0].t, N = Math.floor((win[win.length-1].t - start)/1000*fs), out = [];
+  let j = 0;
+  for (let i=0;i<N;i++){
+    const t = start + i*1000/fs;
+    while (j < win.length-2 && win[j+1].t < t) j++;
+    const a = win[j], b = win[j+1], f = (t-a.t)/((b.t-a.t)||1);
+    out.push(a[key] + (b[key]-a[key])*Math.max(0,Math.min(1,f)));
+  }
+  return out;
+}
+
+function detrend(a){
+  const n=a.length, xm=(n-1)/2, ym=mean(a); let num=0, den=0;
+  a.forEach((v,i)=>{ num+=(i-xm)*(v-ym); den+=(i-xm)**2; });
+  const k=num/den; return a.map((v,i)=>v-ym-k*(i-xm));
+}
+
+function estimate(){
+  const now = performance.now(), tS = ((now - t0)/1000).toFixed(1);
+  const win = samples.filter(s => s.t >= now - 12000);
+  const light = win.length ? mean(win.map(s=>s.g)) : 0;
+  if (win.length < 60 || win[win.length-1].t - win[0].t < 8000){
+    log.push({t:tS, bpm:'', q:'', trend:'', light:light.toFixed(0), event:''}); return;
+  }
+  const fs = 30, R = resample(win,'r',fs), G = resample(win,'g',fs), B = resample(win,'b',fs);
+  const mr=mean(R), mg=mean(G), mb=mean(B);
+  // POS method: projects skin colour change onto a plane orthogonal to skin tone
+  const s1 = G.map((g,i)=> g/mg - B[i]/mb);
+  const s2 = G.map((g,i)=> g/mg + B[i]/mb - 2*R[i]/mr);
+  const alpha = std(s1)/(std(s2)||1);
+  let h = detrend(s1.map((v,i)=> v + alpha*s2[i]));
+  const N = h.length, hw = h.map((v,i)=> v*(0.5-0.5*Math.cos(2*Math.PI*i/(N-1))));
+  let best=0, bestF=0, total=0, count=0;
+  for (let bpm=42; bpm<=180; bpm+=1){
+    const f = bpm/60; let re=0, im=0;
+    for (let i=0;i<N;i++){ const ph = 2*Math.PI*f*i/fs; re += hw[i]*Math.cos(ph); im -= hw[i]*Math.sin(ph); }
+    const p = re*re+im*im; total+=p; count++;
+    if (p>best){ best=p; bestF=bpm; }
+  }
+  const q = best/(total/count);
+  const quality = q > 4 ? 'good' : q > 2.5 ? 'fair' : 'poor';
+  let trend = '';
+  if (quality !== 'poor'){
+    bpmHist.push({t:now, bpm:bestF});
+    while (bpmHist.length && bpmHist[0].t < now - 60000) bpmHist.shift();
+    const recent = median(bpmHist.filter(x=>x.t>=now-10000).map(x=>x.bpm));
+    const base = median(bpmHist.filter(x=>x.t<now-10000 && x.t>=now-40000).map(x=>x.bpm));
+    if (!isNaN(recent) && !isNaN(base)) trend = recent-base > 4 ? 'rising' : recent-base < -4 ? 'falling' : 'steady';
+  }
+  log.push({t:tS, bpm:bestF, q:q.toFixed(2), trend, light:light.toFixed(0), event:''});
+
+  $('bpm').textContent = quality === 'poor' ? '--' : bestF;
+  let msg = 'Signal <b>' + quality + '</b>';
+  if (trend) msg += ', heart rate ' + trend;
+  if (light < 50) msg += '. Too dark: face a window or lamp';
+  else if (quality === 'poor') msg += '. Hold still and keep forehead in the box';
+  $('status').innerHTML = msg + '.';
+
+  lastWave = h.slice(-fs*8); drawWave();
+}
+
+function drawWave(){
+  const dpr = window.devicePixelRatio||1, W = wave.clientWidth, H = wave.clientHeight;
+  wave.width = W*dpr; wave.height = H*dpr; wctx.scale(dpr,dpr);
+  wctx.clearRect(0,0,W,H);
+  if (lastWave.length < 2) return;
+  const sm = lastWave.map((v,i,a)=> (a[i-1]??v + 0)*0.25 + v*0.5 + (a[i+1]??v)*0.25);
+  const mx = Math.max(...sm.map(Math.abs)) || 1;
+  wctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--trace');
+  wctx.lineWidth = 2; wctx.beginPath();
+  sm.forEach((v,i)=>{ const x = i/(sm.length-1)*W, y = H/2 - v/mx*H*0.42; i ? wctx.lineTo(x,y) : wctx.moveTo(x,y); });
+  wctx.stroke();
+}
+</script>
+</body>
+</html>
